@@ -1,10 +1,40 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import {
   parseArgs,
   isProtectedPush,
   checkPushCommand,
 } from "../src/block-master-push.ts"
+
+// ---------------------------------------------------------------------------
+// Config file harness
+//
+// The plugin reads its allow-list from
+// ~/.config/opencode/block-master-push.json, overridable with the
+// BLOCK_MASTER_PUSH_CONFIG env var. The override lets the config policy be
+// tested without patching node:fs.
+// ---------------------------------------------------------------------------
+const CONFIG_ENV = "BLOCK_MASTER_PUSH_CONFIG"
+
+function withConfig(contents: string | null): () => void {
+  const dir = mkdtempSync(join(tmpdir(), "bmp-config-"))
+  const path = join(dir, "block-master-push.json")
+  if (contents !== null) writeFileSync(path, contents)
+  process.env[CONFIG_ENV] = path
+  return () => {
+    delete process.env[CONFIG_ENV]
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+const NOT_ALLOWED = /not in the allow-list/
+
+// ---------------------------------------------------------------------------
+// Unit: argv parsing (unchanged from f19e717)
+// ---------------------------------------------------------------------------
 
 test("parseArgs handles simple args", () => {
   assert.deepEqual(parseArgs("origin master"), ["origin", "master"])
@@ -18,264 +48,390 @@ test("parseArgs preserves quoted strings", () => {
   ])
 })
 
-test("isProtectedPush blocks bare master destination", () => {
-  assert.match(
-    isProtectedPush(["origin", "master"]) ?? "",
-    /destination ref 'master'/
-  )
+// ---------------------------------------------------------------------------
+// Group 1 — protected git destinations are rejected
+// ---------------------------------------------------------------------------
+
+test("blocks git push origin master", () => {
+  assert.match(checkPushCommand("git push origin master") ?? "", /destination ref 'master'/)
 })
 
-test("isProtectedPush blocks src:dst form", () => {
-  assert.match(
-    isProtectedPush(["origin", "feature:master"]) ?? "",
-    /destination ref 'master'/
-  )
+test("blocks git push origin main", () => {
+  assert.match(checkPushCommand("git push origin main") ?? "", /destination ref 'main'/)
 })
 
-test("isProtectedPush blocks delete form", () => {
-  assert.match(
-    isProtectedPush(["origin", ":master"]) ?? "",
-    /destination ref 'master'/
-  )
+test("blocks case-variant git push origin Master", () => {
+  assert.match(checkPushCommand("git push origin Master") ?? "", /destination ref 'master'/)
 })
 
-test("isProtectedPush blocks --all and --mirror", () => {
-  assert.match(
-    isProtectedPush(["origin", "--all"]) ?? "",
-    /\-\-all \/ \-\-mirror/
-  )
-  assert.match(
-    isProtectedPush(["origin", "--mirror"]) ?? "",
-    /\-\-all \/ \-\-mirror/
-  )
-})
-
-test("isProtectedPush allows feature branches", () => {
-  assert.equal(isProtectedPush(["origin", "feature-branch"]), null)
-})
-
-test("isProtectedPush allows master as source (non-dst)", () => {
-  assert.equal(isProtectedPush(["origin", "master:feature"]), null)
-})
-
-test("isProtectedPush filters out flags before parsing refs", () => {
-  assert.equal(isProtectedPush(["-f", "origin", "feature"]), null)
-  assert.match(
-    isProtectedPush(["-f", "origin", "master"]) ?? "",
-    /destination ref 'master'/
-  )
-})
-
-test("isProtectedPush strips + force-push prefix", () => {
-  assert.match(
-    isProtectedPush(["origin", "+master"]) ?? "",
-    /destination ref 'master'/
-  )
-  assert.match(
-    isProtectedPush(["origin", "+refs/heads/master"]) ?? "",
-    /destination ref 'master'/
-  )
-})
-
-test("isProtectedPush normalises refs/heads/ prefix", () => {
-  assert.match(
-    isProtectedPush(["origin", "refs/heads/master"]) ?? "",
-    /destination ref 'master'/
-  )
-  assert.match(
-    isProtectedPush(["origin", "refs/heads/main"]) ?? "",
-    /destination ref 'main'/
-  )
-})
-
-test("isProtectedPush normalises refs/heads/ in src:dst", () => {
-  assert.match(
-    isProtectedPush(["origin", "feature:refs/heads/main"]) ?? "",
-    /destination ref 'main'/
-  )
-  assert.match(
-    isProtectedPush(["origin", "refs/heads/master:refs/heads/main"]) ?? "",
-    /destination ref 'main'/
-  )
-})
-
-test("isProtectedPush is case-insensitive", () => {
-  assert.match(
-    isProtectedPush(["origin", "Master"]) ?? "",
-    /destination ref 'master'/
-  )
-  assert.match(
-    isProtectedPush(["origin", "MAIN"]) ?? "",
-    /destination ref 'main'/
-  )
-})
-
-test("isProtectedPush blocks empty-dst master: form (delete source-named ref)", () => {
-  assert.match(
-    isProtectedPush(["origin", "master:"]) ?? "",
-    /destination ref 'master'/
-  )
-})
-
-test("isProtectedPush allows empty-dst delete of non-protected ref", () => {
-  assert.equal(isProtectedPush(["origin", "feature:"]), null)
-})
-
-test("isProtectedPush blocks multi-destination when one is protected", () => {
-  assert.match(
-    isProtectedPush(["origin", "feature", "master"]) ?? "",
-    /destination ref 'master'/
-  )
-  assert.match(
-    isProtectedPush(["origin", "master", "main"]) ?? "",
-    /destination ref/
-  )
-})
-
-test("isProtectedPush allows multi-destination when none is protected", () => {
-  assert.equal(isProtectedPush(["origin", "feature", "release"]), null)
-})
-
-test("checkPushCommand only matches git push at command position", () => {
-  assert.equal(checkPushCommand("git status"), null)
-  assert.equal(checkPushCommand("git pushd /tmp"), null)
-  assert.equal(checkPushCommand("echo git push origin master"), null)
-  assert.equal(
-    checkPushCommand("xargs git push origin master"),
-    null
-  )
-})
-
-test("checkPushCommand allows dry-run before refspec", () => {
-  assert.equal(checkPushCommand("git push --dry-run origin master"), null)
-  assert.equal(checkPushCommand("git push -n origin master"), null)
-})
-
-test("checkPushCommand allows dry-run after refspec", () => {
-  assert.equal(checkPushCommand("git push origin master --dry-run"), null)
-  assert.equal(
-    checkPushCommand("git push origin master -n"),
-    null
-  )
-})
-
-test("checkPushCommand blocks real pushes", () => {
-  assert.match(
-    checkPushCommand("git push origin master") ?? "",
-    /destination ref 'master'/
-  )
-  assert.match(
-    checkPushCommand("git push upstream main") ?? "",
-    /destination ref 'main'/
-  )
-})
-
-test("checkPushCommand handles git -C <path> push", () => {
-  assert.match(
-    checkPushCommand("git -C /tmp push origin master") ?? "",
-    /destination ref 'master'/
-  )
-})
-
-test("checkPushCommand handles git -c key=value push", () => {
-  assert.match(
-    checkPushCommand("git -c push.default=current push origin master") ?? "",
-    /destination ref 'master'/
-  )
-})
-
-test("checkPushCommand handles git --no-pager push", () => {
-  assert.match(
-    checkPushCommand("git --no-pager push origin master") ?? "",
-    /destination ref 'master'/
-  )
-})
-
-test("checkPushCommand handles git -P push", () => {
-  assert.match(
-    checkPushCommand("git -P push origin master") ?? "",
-    /destination ref 'master'/
-  )
-})
-
-test("checkPushCommand blocks chained push after &&", () => {
-  assert.match(
-    checkPushCommand("git status && git push origin master") ?? "",
-    /destination ref 'master'/
-  )
-})
-
-test("checkPushCommand blocks chained push after ;", () => {
-  assert.match(
-    checkPushCommand("git status; git push origin master") ?? "",
-    /destination ref 'master'/
-  )
-})
-
-test("checkPushCommand blocks chained push after |", () => {
-  assert.match(
-    checkPushCommand("git status | git push origin master") ?? "",
-    /destination ref 'master'/
-  )
-})
-
-test("checkPushCommand blocks refs/heads/master destination", () => {
+test("blocks git push origin refs/heads/master", () => {
   assert.match(
     checkPushCommand("git push origin refs/heads/master") ?? "",
     /destination ref 'master'/
   )
 })
 
-test("checkPushCommand blocks force-push +master", () => {
+test("blocks force-push git push origin +master", () => {
+  assert.match(checkPushCommand("git push origin +master") ?? "", /destination ref 'master'/)
+})
+
+test("blocks empty-destination git push origin master:", () => {
+  assert.match(checkPushCommand("git push origin master:") ?? "", /destination ref 'master'/)
+})
+
+test("blocks git push origin feature:master", () => {
   assert.match(
-    checkPushCommand("git push origin +master") ?? "",
+    checkPushCommand("git push origin feature:master") ?? "",
     /destination ref 'master'/
   )
 })
 
-test("checkPushCommand blocks --all at command level", () => {
-  assert.match(
-    checkPushCommand("git push --all origin master") ?? "",
-    /\-\-all \/ \-\-mirror/
-  )
+test("blocks git push --all origin master", () => {
+  assert.match(checkPushCommand("git push --all origin master") ?? "", /--all/)
 })
 
-test("checkPushCommand blocks --mirror at command level", () => {
-  assert.match(
-    checkPushCommand("git push --mirror origin") ?? "",
-    /\-\-all \/ \-\-mirror/
-  )
+test("blocks git push --mirror origin", () => {
+  assert.match(checkPushCommand("git push --mirror origin") ?? "", /--mirror/)
 })
 
-test("checkPushCommand allows --delete on non-protected ref", () => {
-  assert.equal(
-    checkPushCommand("git push origin --delete feature"),
-    null
-  )
-})
-
-test("checkPushCommand blocks --delete on protected ref", () => {
+test("blocks git push origin --delete master", () => {
   assert.match(
     checkPushCommand("git push origin --delete master") ?? "",
     /destination ref 'master'/
   )
 })
 
-test("checkPushCommand blocks case variant", () => {
+test("blocks multiple refs when one destination is protected", () => {
   assert.match(
-    checkPushCommand("git push origin Master") ?? "",
+    checkPushCommand("git push origin feature main") ?? "",
+    /destination ref 'main'/
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Group 2 — git commands that are not protected pushes are allowed
+// ---------------------------------------------------------------------------
+
+test("allows git push origin feature", () => {
+  assert.equal(checkPushCommand("git push origin feature"), null)
+})
+
+test("allows git status", () => {
+  assert.equal(checkPushCommand("git status"), null)
+})
+
+test("allows git pushd /tmp", () => {
+  assert.equal(checkPushCommand("git pushd /tmp"), null)
+})
+
+test("allows git config alias definition mentioning push origin master", () => {
+  assert.equal(checkPushCommand("git config alias.p 'push origin master'"), null)
+})
+
+test("allows git push origin --delete feature", () => {
+  assert.equal(checkPushCommand("git push origin --delete feature"), null)
+})
+
+test("allows dry-run pushes to master", () => {
+  // --dry-run / -n never move a ref, so the protected destination is
+  // unreachable. Pinned here so the exemption stays deliberate.
+  assert.equal(checkPushCommand("git push --dry-run origin master"), null)
+  assert.equal(checkPushCommand("git push origin master -n"), null)
+})
+
+test("allows git -C <path> push origin feature", () => {
+  assert.equal(checkPushCommand("git -C /tmp push origin feature"), null)
+})
+
+test("allows git -c key=value push origin feature", () => {
+  assert.equal(
+    checkPushCommand("git -c push.default=current push origin feature"),
+    null
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Group 3 — irreducible limitations, pinned so they stay visible
+// ---------------------------------------------------------------------------
+
+test("PIN: bare 'git push' is allowed (needs git rev-parse --abbrev-ref HEAD)", () => {
+  assert.equal(checkPushCommand("git push"), null)
+})
+
+test("PIN: 'git push origin HEAD' is allowed (destination resolved by git)", () => {
+  assert.equal(checkPushCommand("git push origin HEAD"), null)
+})
+
+test("PIN: git aliases are not expanded by the plugin", () => {
+  // Alias expansion happens inside git, so the plugin only sees `git p`.
+  assert.equal(checkPushCommand("git p"), null)
+})
+
+test("PIN: script invocations are rejected by the outer allow-list", () => {
+  // The gate cannot see what a script body does once it is running; the only
+  // defence left is refusing to launch it at all.
+  assert.match(checkPushCommand("./script.sh") ?? "", NOT_ALLOWED)
+  assert.match(checkPushCommand("bash script.sh") ?? "", NOT_ALLOWED)
+})
+
+// ---------------------------------------------------------------------------
+// Group 4 — the pivot: every non-git interpreter and launcher is rejected
+// ---------------------------------------------------------------------------
+
+test("rejects bash -c 'git push origin master'", () => {
+  assert.match(
+    checkPushCommand(`bash -c "git push origin master"`) ?? "",
+    NOT_ALLOWED
+  )
+})
+
+test("rejects sh -c 'git push origin master'", () => {
+  assert.match(checkPushCommand(`sh -c "git push origin master"`) ?? "", NOT_ALLOWED)
+})
+
+test("rejects env git push origin master", () => {
+  assert.match(checkPushCommand("env git push origin master") ?? "", NOT_ALLOWED)
+})
+
+test("rejects python3 -c with an inline push", () => {
+  assert.match(
+    checkPushCommand(`python3 -c "os.system('git push origin master')"`) ?? "",
+    NOT_ALLOWED
+  )
+})
+
+test("rejects ruby -e with an inline push", () => {
+  assert.match(
+    checkPushCommand(`ruby -e 'system("git push origin master")'`) ?? "",
+    NOT_ALLOWED
+  )
+})
+
+test("rejects node -e with an inline push", () => {
+  assert.match(
+    checkPushCommand(`node -e 'require("child_process").execSync("git push origin master")'`) ?? "",
+    NOT_ALLOWED
+  )
+})
+
+test("rejects perl -e with an inline push", () => {
+  assert.match(checkPushCommand(`perl -e 'system("git push origin master")'`) ?? "", NOT_ALLOWED)
+})
+
+test("rejects awk BEGIN{system(...)}", () => {
+  assert.match(
+    checkPushCommand(`awk 'BEGIN{system("git push origin master")}'`) ?? "",
+    NOT_ALLOWED
+  )
+})
+
+test("rejects subshell '(git push origin master)'", () => {
+  assert.match(checkPushCommand("(git push origin master)") ?? "", NOT_ALLOWED)
+})
+
+test("rejects brace group '{ git push origin master; }'", () => {
+  assert.match(checkPushCommand("{ git push origin master; }") ?? "", NOT_ALLOWED)
+})
+
+test("rejects unknown outer command", () => {
+  assert.match(checkPushCommand("make deploy") ?? "", NOT_ALLOWED)
+})
+
+// ---------------------------------------------------------------------------
+// Group 5 — env prefixes are stripped, then the git rule applies
+// ---------------------------------------------------------------------------
+
+test("strips FOO=bar prefix and blocks the protected push", () => {
+  assert.match(
+    checkPushCommand("FOO=bar git push origin master") ?? "",
     /destination ref 'master'/
   )
 })
 
-test("checkPushCommand does not block bare git push (documented limitation)", () => {
-  // Resolving the current branch would require a sub-process to git
-  // (e.g. `git rev-parse --abbrev-ref HEAD`). Out of scope for the
-  // regex-based detector. Test pins current behaviour.
-  assert.equal(checkPushCommand("git push"), null)
+test("strips multiple env prefixes and blocks the protected push", () => {
+  assert.match(
+    checkPushCommand("FOO=bar BAZ=qux git push origin main") ?? "",
+    /destination ref 'main'/
+  )
 })
 
-test("default export hook blocks protected push", async () => {
+test("strips env prefix and allows a feature push", () => {
+  assert.equal(checkPushCommand("FOO=bar git push origin feature"), null)
+})
+
+// ---------------------------------------------------------------------------
+// Group 6 — chained commands are segmented, then each segment classified
+// ---------------------------------------------------------------------------
+
+test("blocks a protected push chained after ;", () => {
+  assert.match(
+    checkPushCommand("git status; git push origin master") ?? "",
+    /destination ref 'master'/
+  )
+})
+
+test("blocks a protected push chained after &&", () => {
+  assert.match(
+    checkPushCommand("git push origin master && echo done") ?? "",
+    /destination ref 'master'/
+  )
+})
+
+test("blocks a protected push after a pipe", () => {
+  assert.match(
+    checkPushCommand("git status | grep x && git push origin main") ?? "",
+    /destination ref 'main'/
+  )
+})
+
+test("allows a safe chain of git and echo", () => {
+  assert.equal(checkPushCommand("git status && echo done"), null)
+})
+
+test("allows an echo of a push string (quoted, inert)", () => {
+  assert.equal(checkPushCommand(`echo "git push origin master"`), null)
+})
+
+// ---------------------------------------------------------------------------
+// Group 7 — built-in safe-list commands are allowed
+// ---------------------------------------------------------------------------
+
+test("allows every built-in safe command", () => {
+  const cases: Record<string, string> = {
+    echo: "echo hi",
+    cat: "cat file.txt",
+    head: "head -n 5 file.txt",
+    tail: "tail -f log.txt",
+    tr: "tr a-z A-Z",
+    cut: "cut -d: -f1 file.txt",
+    paste: "paste a b",
+    sort: "sort f",
+    uniq: "sort f | uniq -c",
+    wc: "wc -l f",
+    grep: "grep -rn needle src",
+    ls: "ls -la",
+    pwd: "pwd",
+    date: "date",
+    whoami: "whoami",
+    id: "id",
+    uname: "uname -a",
+    file: "file f",
+    df: "df -h",
+    du: "du -sh .",
+    diff: "diff a b",
+    comm: "comm a b",
+    cmp: "cmp a b",
+    true: "true",
+    false: "false",
+    test: "test -f file.txt",
+    tee: "cat f | tee out.txt",
+    cp: "cp a b",
+    mv: "mv a b",
+    rm: "rm -f tmp",
+    mkdir: "mkdir -p out",
+    rmdir: "rmdir empty",
+    touch: "touch file.txt",
+  }
+  for (const [command, invocation] of Object.entries(cases)) {
+    assert.equal(
+      checkPushCommand(invocation),
+      null,
+      `${command} (${invocation}) should be allowed`
+    )
+  }
+})
+
+test("does not treat less/more as wrappers", () => {
+  assert.equal(checkPushCommand("more f"), null)
+})
+
+// ---------------------------------------------------------------------------
+// Group 8 — config file policy
+// ---------------------------------------------------------------------------
+
+test("config file missing: built-in defaults apply", (t) => {
+  const restore = withConfig(null)
+  t.after(restore)
+  assert.equal(checkPushCommand("echo hi"), null)
+  assert.match(checkPushCommand("git push origin master") ?? "", /destination ref 'master'/)
+  assert.match(checkPushCommand("awk 'BEGIN{}'") ?? "", NOT_ALLOWED)
+})
+
+test("config without additionalAllowedOuterCommands: built-in defaults apply", (t) => {
+  const restore = withConfig(JSON.stringify({ someOtherKey: true }))
+  t.after(restore)
+  assert.equal(checkPushCommand("echo hi"), null)
+  assert.match(checkPushCommand("awk 'BEGIN{}'") ?? "", NOT_ALLOWED)
+})
+
+test("config additionalAllowedOuterCommands extends the allow-list", (t) => {
+  const restore = withConfig(
+    JSON.stringify({ additionalAllowedOuterCommands: ["awk", "sed", "xargs"] })
+  )
+  t.after(restore)
+  assert.equal(checkPushCommand("awk 'BEGIN{}'"), null)
+  assert.equal(checkPushCommand("xargs echo hi"), null)
+  // git is still checked, even when the config exists
+  assert.match(checkPushCommand("git push origin master") ?? "", /destination ref 'master'/)
+})
+
+test("config with an empty additionalAllowedOuterCommands keeps defaults", (t) => {
+  const restore = withConfig(JSON.stringify({ additionalAllowedOuterCommands: [] }))
+  t.after(restore)
+  assert.equal(checkPushCommand("echo hi"), null)
+  assert.match(checkPushCommand("make deploy") ?? "", NOT_ALLOWED)
+})
+
+test("malformed config JSON fails closed and rejects every command", (t) => {
+  const restore = withConfig("{ this is not json")
+  t.after(restore)
+  assert.match(checkPushCommand("echo hi") ?? "", /malformed/i)
+  assert.match(checkPushCommand("ls -la") ?? "", /malformed/i)
+  assert.match(checkPushCommand("git push origin feature") ?? "", /malformed/i)
+  assert.match(checkPushCommand("git push origin master") ?? "", /malformed/i)
+})
+
+test("config with a non-array additionalAllowedOuterCommands fails closed", (t) => {
+  const restore = withConfig(JSON.stringify({ additionalAllowedOuterCommands: "awk" }))
+  t.after(restore)
+  assert.match(checkPushCommand("echo hi") ?? "", /must be an array/i)
+  assert.match(checkPushCommand("git push origin feature") ?? "", /must be an array/i)
+})
+
+test("malformed config does not break the hook, it blocks it", async (t) => {
+  const restore = withConfig("{ broken")
+  t.after(restore)
+  const mod = await import("../src/block-master-push.ts")
+  const hooks = await mod.default()
+  const hook = hooks["tool.execute.before"]
+  await assert.rejects(
+    () =>
+      hook(
+        { tool: "bash", sessionID: "s", callID: "c" },
+        { args: { command: "git push origin master" } }
+      ),
+    /malformed/i
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Group 9 — unit-level isProtectedPush still behaves (kept from f19e717)
+// ---------------------------------------------------------------------------
+
+test("isProtectedPush blocks a protected destination directly", () => {
+  assert.match(isProtectedPush(["origin", "master"]) ?? "", /destination ref 'master'/)
+  assert.equal(isProtectedPush(["origin", "feature"]), null)
+})
+
+test("isProtectedPush allows master as the source of a push", () => {
+  assert.equal(isProtectedPush(["origin", "master:feature"]), null)
+})
+
+// ---------------------------------------------------------------------------
+// Group 10 — hook integration
+// ---------------------------------------------------------------------------
+
+test("default export hook blocks a protected push", async () => {
   const mod = await import("../src/block-master-push.ts")
   const hooks = await mod.default()
   const hook = hooks["tool.execute.before"]
@@ -289,7 +445,7 @@ test("default export hook blocks protected push", async () => {
   )
 })
 
-test("default export hook allows safe commands", async () => {
+test("default export hook allows a feature push", async () => {
   const mod = await import("../src/block-master-push.ts")
   const hooks = await mod.default()
   const hook = hooks["tool.execute.before"]
@@ -307,4 +463,41 @@ test("default export hook ignores non-bash tools", async () => {
     { tool: "read", sessionID: "s", callID: "c" },
     { args: { filePath: "/etc/passwd" } }
   )
+})
+
+test("default export hook ignores a non-string command", async () => {
+  const mod = await import("../src/block-master-push.ts")
+  const hooks = await mod.default()
+  const hook = hooks["tool.execute.before"]
+  await hook(
+    { tool: "bash", sessionID: "s", callID: "c" },
+    { args: { command: 42 as unknown as string } }
+  )
+})
+
+test("default export hook rejects an interpreter bypass", async () => {
+  const mod = await import("../src/block-master-push.ts")
+  const hooks = await mod.default()
+  const hook = hooks["tool.execute.before"]
+  await assert.rejects(
+    () =>
+      hook(
+        { tool: "bash", sessionID: "s", callID: "c" },
+        { args: { command: `bash -c "git push origin master"` } }
+      ),
+    NOT_ALLOWED
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Group 11 — non-string / empty input guards
+// ---------------------------------------------------------------------------
+
+test("empty command is allowed", () => {
+  assert.equal(checkPushCommand(""), null)
+  assert.equal(checkPushCommand("   "), null)
+})
+
+test("command of only separators produces no segments", () => {
+  assert.equal(checkPushCommand(";;"), null)
 })
