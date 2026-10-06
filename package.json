@@ -1,0 +1,16 @@
+{
+  "name": "block-master-push",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenCode plugin that aborts git push commands whose destination ref is master or main",
+  "scripts": {
+    "lint": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types test/*.test.ts"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.16",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
