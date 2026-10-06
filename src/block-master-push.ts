@@ -30,6 +30,13 @@ export function parseArgs(input: string): string[] {
   return out
 }
 
+function normaliseRef(ref: string): string {
+  let r = ref
+  if (r.startsWith("+")) r = r.slice(1)
+  if (r.startsWith("refs/heads/")) r = r.slice("refs/heads/".length)
+  return r.toLowerCase()
+}
+
 function destinationsOf(args: string[]): string[] {
   const positional: string[] = []
   for (const a of args) if (!a.startsWith("-")) positional.push(a)
@@ -38,10 +45,13 @@ function destinationsOf(args: string[]): string[] {
   const destinations: string[] = []
   for (const ref of refs) {
     if (ref.includes(":")) {
-      const dst = ref.split(":", 2)[1]
-      if (dst) destinations.push(dst)
+      const parts = ref.split(":", 2)
+      const src = parts[0]
+      const dst = parts[1]
+      const effective = dst || src
+      if (effective) destinations.push(normaliseRef(effective))
     } else {
-      destinations.push(ref)
+      destinations.push(normaliseRef(ref))
     }
   }
   return destinations
@@ -57,20 +67,37 @@ export function isProtectedPush(args: string[]): string | null {
   return null
 }
 
+const GIT_PUSH_REGEX =
+  /(^|[;&|(]\s|\(\s)\s*\bgit\b(?:\s+(?:-c\s+\S+|-C\s+\S+|--\S+(?:=\S+)?|-\S+))*\s+\bpush\b/g
+
 export function checkPushCommand(command: string): string | null {
   const trimmed = command.trim()
-  const match = trimmed.match(/^git\s+push\b\s*(.*)$/)
-  if (!match) return null
-  if (/(^|\s)(--dry-run|-n)(\s|$)/.test(match[1])) return null
-  return isProtectedPush(parseArgs(match[1]))
+  if (!trimmed) return null
+
+  const matches = [...trimmed.matchAll(GIT_PUSH_REGEX)]
+  if (matches.length === 0) return null
+
+  for (const match of matches) {
+    const matchStart = match.index! + match[1].length
+    const args = parseArgs(trimmed.slice(matchStart))
+    if (args.length < 2 || args[0] !== "git") continue
+
+    const pushIdx = args.indexOf("push")
+    if (pushIdx < 0) continue
+
+    const pushArgs = args.slice(pushIdx)
+    if (pushArgs.includes("--dry-run") || pushArgs.includes("-n")) continue
+
+    const reason = isProtectedPush(pushArgs)
+    if (reason) return reason
+  }
+
+  return null
 }
 
 export default (async () => {
   return {
-    "tool.execute.before": async (
-      input: { tool: string; sessionID: string; callID: string },
-      output: { args: { command?: unknown; [k: string]: unknown }; metadata: unknown }
-    ) => {
+    "tool.execute.before": async (input, output) => {
       if (input.tool !== "bash") return
       const cmd = output.args?.command
       if (typeof cmd !== "string") return
