@@ -174,6 +174,44 @@ test("PIN: script invocations are rejected by the outer allow-list", () => {
   assert.match(checkPushCommand("bash script.sh") ?? "", NOT_ALLOWED)
 })
 
+test("PIN: variable expansion in git push args is not detected by the gate", () => {
+  // Bash would expand $MASTER to "master" and push to master; the gate only
+  // sees the literal token $MASTER. The plugin's threat model is the gate
+  // refusing what bash evaluates, NOT evaluating bash itself.
+  assert.equal(checkPushCommand("git push origin $MASTER"), null)
+})
+
+test("PIN: ${VAR:-default} expansion in git push args is not detected", () => {
+  assert.equal(checkPushCommand("git push origin ${MASTER:-master}"), null)
+})
+
+test("PIN: backtick command substitution is not detected", () => {
+  assert.equal(checkPushCommand("git push origin `echo master`"), null)
+})
+
+test("PIN: $(...) command substitution is not detected", () => {
+  assert.equal(checkPushCommand("git push origin $(echo master)"), null)
+})
+
+test("PIN: ANSI-C quoting is not decoded by the gate", () => {
+  // $'\x6d\x61\x73\x74\x65\x72' is bash's spelling of "master".
+  assert.equal(checkPushCommand("git push origin $'\\x6d\\x61\\x73\\x74\\x65\\x72'"), null)
+})
+
+test("PIN: brace expansion is not expanded by the gate", () => {
+  // bash expands {main,master} to two args; the gate sees the literal text.
+  assert.equal(checkPushCommand("git push origin {main,master}"), null)
+})
+
+test("PIN: bare-path /usr/bin/git is rejected as not in the safe-list", () => {
+  // The allow-list contains `git`, not `/usr/bin/git`. Users with a non-PATH
+  // git must whitelist the full path via additionalAllowedOuterCommands.
+  assert.match(
+    checkPushCommand("/usr/bin/git push origin master") ?? "",
+    NOT_ALLOWED
+  )
+})
+
 // ---------------------------------------------------------------------------
 // Group 4 — the pivot: every non-git interpreter and launcher is rejected
 // ---------------------------------------------------------------------------

@@ -30,6 +30,11 @@ import { homedir } from "node:os"
 //   - script files and sourced bodies (`./script.sh`, `bash script.sh`,
 //     `. script.sh`) — rejected at launch, but a body already running is opaque.
 //   - shell functions defined by an earlier invocation — not visible.
+//   - variable / command / quote expansion in `git push` destination args
+//     (`$VAR`, `${VAR:-master}`, `$(...)`, backticks, `$'\x6d\x61\x73\x74\x65\x72'`,
+//     `{a,b}` brace, glob) — bash evaluates, the gate sees only literals.
+//   - bare-path `/usr/bin/git` — rejected as not in the safe-list; users with
+//     a non-PATH git must whitelist the full path via config.
 //
 // The canonical defence is still server-side branch protection on the remote.
 // ---------------------------------------------------------------------------
