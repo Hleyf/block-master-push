@@ -7,6 +7,7 @@ import {
   parseArgs,
   isProtectedPush,
   checkPushCommand,
+  getPluginStatus,
 } from "../src/block-master-push.ts"
 
 // ---------------------------------------------------------------------------
@@ -567,4 +568,107 @@ test("empty command is allowed", () => {
 
 test("command of only separators produces no segments", () => {
   assert.equal(checkPushCommand(";;"), null)
+})
+
+// ---------------------------------------------------------------------------
+// Group 12 — visual indicator (so the user can confirm the plugin is loaded)
+// ---------------------------------------------------------------------------
+
+test("getPluginStatus returns ACTIVE by default", () => {
+  delete process.env.BLOCK_MASTER_PUSH_DISABLED
+  const status = getPluginStatus()
+  assert.equal(status.active, true)
+  assert.ok(status.version)
+  assert.ok(status.commit)
+})
+
+test("getPluginStatus returns INACTIVE when BLOCK_MASTER_PUSH_DISABLED=1", () => {
+  process.env.BLOCK_MASTER_PUSH_DISABLED = "1"
+  try {
+    const status = getPluginStatus()
+    assert.equal(status.active, false)
+    assert.match(status.reason ?? "", /BLOCK_MASTER_PUSH_DISABLED=1/)
+  } finally {
+    delete process.env.BLOCK_MASTER_PUSH_DISABLED
+  }
+})
+
+test("self-test command 'block-master-push status' throws with ACTIVE status", async () => {
+  delete process.env.BLOCK_MASTER_PUSH_DISABLED
+  const mod = await import("../src/block-master-push.ts")
+  const hooks = await mod.default()
+  const hook = hooks["tool.execute.before"]
+  await assert.rejects(
+    () =>
+      hook(
+        { tool: "bash", sessionID: "s", callID: "c" },
+        { args: { command: "block-master-push status" } }
+      ),
+    /\[block-master-push: ACTIVE\]/
+  )
+})
+
+test("self-test command '__bmp_status__' (alternate form) also throws", async () => {
+  delete process.env.BLOCK_MASTER_PUSH_DISABLED
+  const mod = await import("../src/block-master-push.ts")
+  const hooks = await mod.default()
+  const hook = hooks["tool.execute.before"]
+  await assert.rejects(
+    () =>
+      hook(
+        { tool: "bash", sessionID: "s", callID: "c" },
+        { args: { command: "__bmp_status__" } }
+      ),
+    /\[block-master-push: ACTIVE\]/
+  )
+})
+
+test("self-test command shows INACTIVE when BLOCK_MASTER_PUSH_DISABLED=1", async () => {
+  process.env.BLOCK_MASTER_PUSH_DISABLED = "1"
+  try {
+    const mod = await import("../src/block-master-push.ts")
+    const hooks = await mod.default()
+    const hook = hooks["tool.execute.before"]
+    await assert.rejects(
+      () =>
+        hook(
+          { tool: "bash", sessionID: "s", callID: "c" },
+          { args: { command: "block-master-push status" } }
+        ),
+      /\[block-master-push: INACTIVE\]/
+    )
+  } finally {
+    delete process.env.BLOCK_MASTER_PUSH_DISABLED
+  }
+})
+
+test("disabled plugin does NOT block a protected push (sanity check)", async () => {
+  process.env.BLOCK_MASTER_PUSH_DISABLED = "1"
+  try {
+    const mod = await import("../src/block-master-push.ts")
+    const hooks = await mod.default()
+    const hook = hooks["tool.execute.before"]
+    // Should NOT throw — plugin is disabled, push goes through (would actually
+    // push to master in real life, but here we just verify the hook didn't block)
+    await hook(
+      { tool: "bash", sessionID: "s", callID: "c" },
+      { args: { command: "git push origin master" } }
+    )
+  } finally {
+    delete process.env.BLOCK_MASTER_PUSH_DISABLED
+  }
+})
+
+test("system prompt hook injects ACTIVE status into system array", async () => {
+  delete process.env.BLOCK_MASTER_PUSH_DISABLED
+  const mod = await import("../src/block-master-push.ts")
+  const hooks = await mod.default()
+  const hook = hooks["experimental.chat.system.transform"]
+  assert.ok(hook, "system transform hook not registered")
+  const output = { system: [] as string[] }
+  await hook({ model: {} as any }, output)
+  assert.ok(
+    output.system.some((s: string) => s.includes("[block-master-push: ACTIVE")),
+    `expected system to include [block-master-push: ACTIVE], got: ${JSON.stringify(output.system)}`
+  )
 })

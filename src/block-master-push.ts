@@ -36,8 +36,21 @@ import { homedir } from "node:os"
 //   - bare-path `/usr/bin/git` — rejected as not in the safe-list; users with
 //     a non-PATH git must whitelist the full path via config.
 //
+// Visual indicator (so the user can confirm the plugin is loaded):
+//   - console.log on plugin load: "[block-master-push: ACTIVE] vX.Y.Z @ <sha>"
+//   - injected into the system prompt on every LLM call via
+//     `experimental.chat.system.transform`
+//   - self-test: run `block-master-push status` in bash. The plugin throws
+//     a status message that surfaces in the opencode chat as a denied
+//     tool call. Use this to verify the plugin is actually loaded.
+//   - set BLOCK_MASTER_PUSH_DISABLED=1 in the environment to load the
+//     plugin without blocking — useful for cleanup operations.
+//
 // The canonical defence is still server-side branch protection on the remote.
 // ---------------------------------------------------------------------------
+
+const VERSION = "0.2.0"
+const COMMIT = "bc5d48f"  // last commit this plugin was tested with; bump manually when shipping
 
 const PROTECTED = new Set(["master", "main"])
 
@@ -131,6 +144,23 @@ function loadUserAllowList(): AllowList {
   }
 
   return { ok: true, extra: new Set(extra as string[]) }
+}
+
+export function getPluginStatus(): {
+  active: boolean
+  version: string
+  commit: string
+  reason?: string
+} {
+  if (process.env.BLOCK_MASTER_PUSH_DISABLED === "1") {
+    return {
+      active: false,
+      version: VERSION,
+      commit: COMMIT,
+      reason: "BLOCK_MASTER_PUSH_DISABLED=1",
+    }
+  }
+  return { active: true, version: VERSION, commit: COMMIT }
 }
 
 export function parseArgs(input: string): string[] {
@@ -302,11 +332,49 @@ export function checkPushCommand(command: string): string | null {
 }
 
 export default (async () => {
+  const loadStatus = getPluginStatus()
+  console.log(
+    `[block-master-push: ${loadStatus.active ? "ACTIVE" : "INACTIVE"}] ` +
+      `v${loadStatus.version} @ ${loadStatus.commit}` +
+      (loadStatus.reason ? ` (${loadStatus.reason})` : "") +
+      ` — pushes to master/main are ${loadStatus.active ? "blocked" : "NOT blocked"}`
+  )
+
   return {
+    "experimental.chat.system.transform": async (_input, output) => {
+      const status = getPluginStatus()
+      if (status.active) {
+        output.system.push(
+          `[block-master-push: ACTIVE v${status.version}] — git push to master/main is blocked by an opencode plugin. Pivot work must go through a feature branch.`
+        )
+      } else {
+        output.system.push(
+          `[block-master-push: INACTIVE v${status.version}] — plugin is loaded but disabled (${status.reason ?? "unknown"}). Pushes to master/main are NOT blocked.`
+        )
+      }
+    },
     "tool.execute.before": async (input, output) => {
       if (input.tool !== "bash") return
       const cmd = output.args?.command
       if (typeof cmd !== "string") return
+
+      // Self-test: a single-purpose command that throws a status message.
+      // Surfaces in the opencode chat as a denied tool call with the status
+      // text — the most direct way to verify the plugin is actually loaded.
+      const trimmed = cmd.trim()
+      if (trimmed === "block-master-push status" || trimmed === "__bmp_status__") {
+        const status = getPluginStatus()
+        throw new Error(
+          `[block-master-push: ${status.active ? "ACTIVE" : "INACTIVE"}] ` +
+            `v${status.version} @ ${status.commit}` +
+            (status.reason ? ` (${status.reason})` : "") +
+            ` — pushes to master/main are ${status.active ? "blocked" : "NOT blocked"}`
+        )
+      }
+
+      // When disabled, the plugin is loaded but does not block.
+      if (process.env.BLOCK_MASTER_PUSH_DISABLED === "1") return
+
       const reason = checkPushCommand(cmd)
       if (reason) {
         throw new Error(
