@@ -76,12 +76,18 @@ const SAFE_OUTER_COMMANDS = new Set([
 ])
 
 const CONFIG_ENV_VAR = "BLOCK_MASTER_PUSH_CONFIG"
-const DEFAULT_CONFIG_PATH = join(
-  homedir(),
-  ".config",
-  "opencode",
-  "block-master-push.json"
-)
+
+/**
+ * Resolves the default config root each call: ${XDG_CONFIG_HOME}/opencode
+ * when XDG_CONFIG_HOME is set and non-empty (Linux users with a non-default
+ * XDG config home), otherwise ~/.config/opencode. Computed lazily so a
+ * process that sets XDG_CONFIG_HOME after import still picks it up.
+ */
+function defaultConfigPath(): string {
+  const xdg = process.env.XDG_CONFIG_HOME
+  const root = xdg && xdg.length > 0 ? xdg : join(homedir(), ".config")
+  return join(root, "opencode", "block-master-push.json")
+}
 
 type AllowList =
   | { ok: true; extra: Set<string> }
@@ -95,7 +101,7 @@ type AllowList =
  * falling back to a weaker policy.
  */
 function loadUserAllowList(): AllowList {
-  const path = process.env[CONFIG_ENV_VAR] || DEFAULT_CONFIG_PATH
+  const path = process.env[CONFIG_ENV_VAR] || defaultConfigPath()
   if (!existsSync(path)) return { ok: true, extra: new Set() }
 
   let parsed: unknown

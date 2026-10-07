@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -396,6 +396,35 @@ test("config with a non-array additionalAllowedOuterCommands fails closed", (t) 
   t.after(restore)
   assert.match(checkPushCommand("echo hi") ?? "", /must be an array/i)
   assert.match(checkPushCommand("git push origin feature") ?? "", /must be an array/i)
+})
+
+test("config file under XDG_CONFIG_HOME extends the allow-list", (t) => {
+  // BLOCK_MASTER_PUSH_CONFIG takes precedence; the XDG path is the default
+  // when the override is unset. Linux users with a non-default XDG config
+  // home must find the file at ${XDG_CONFIG_HOME}/opencode/block-master-push.json.
+  const savedOverride = process.env[CONFIG_ENV]
+  const savedXdg = process.env.XDG_CONFIG_HOME
+  delete process.env[CONFIG_ENV]
+
+  const xdgRoot = mkdtempSync(join(tmpdir(), "bmp-xdg-"))
+  const opencodeDir = join(xdgRoot, "opencode")
+  mkdirSync(opencodeDir, { recursive: true })
+  writeFileSync(
+    join(opencodeDir, "block-master-push.json"),
+    JSON.stringify({ additionalAllowedOuterCommands: ["xargs"] })
+  )
+  process.env.XDG_CONFIG_HOME = xdgRoot
+
+  t.after(() => {
+    if (savedOverride === undefined) delete process.env[CONFIG_ENV]
+    else process.env[CONFIG_ENV] = savedOverride
+    if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME
+    else process.env.XDG_CONFIG_HOME = savedXdg
+    rmSync(xdgRoot, { recursive: true, force: true })
+  })
+
+  // xargs was added by the XDG-rooted config — the gate accepts it.
+  assert.equal(checkPushCommand("xargs echo hi"), null)
 })
 
 test("malformed config does not break the hook, it blocks it", async (t) => {
