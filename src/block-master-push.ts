@@ -3,58 +3,11 @@ import { readFileSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 
-// ---------------------------------------------------------------------------
-// Strategy: strict outer allow-list (pivot from the bash-grammar detector).
-//
-// After five iterations of modelling bash grammar, every round closed
-// bypasses in one corner and opened them in another: aliases, sourced
-// scripts, env-var prefixes, versioned interpreter names, alternate shells,
-// wrapper chains. Bash has no finite grammar, so there is no state in which
-// static analysis is provably complete.
-//
-// This gate therefore does NOT try to understand the command. It segments the
-// input on the shell's separator operators and accepts a segment only when its
-// first word is `git` (checked against the protected-destination rules) or a
-// member of an allow-list. Everything else — every interpreter, every launcher,
-// every script file, every wrapper — is rejected by construction, because the
-// gate never needs to model what it refuses.
-//
-// Deliberately absent: heredocs, `$( )`, backticks, `eval`, recursion. They are
-// not needed, because nothing but `git` is ever allowed.
-//
-// Irreducible limitations, each pinned by a test:
-//   - bare `git push` / `git push origin HEAD` — the destination is resolved
-//     by git (needs `git rev-parse --abbrev-ref HEAD`).
-//   - git aliases (`git config alias.p 'push origin master'; git p`) — alias
-//     expansion happens inside git.
-//   - script files and sourced bodies (`./script.sh`, `bash script.sh`,
-//     `. script.sh`) — rejected at launch, but a body already running is opaque.
-//   - shell functions defined by an earlier invocation — not visible.
-//   - variable / command / quote expansion in `git push` destination args
-//     (`$VAR`, `${VAR:-master}`, `$(...)`, backticks, `$'\x6d\x61\x73\x74\x65\x72'`,
-//     `{a,b}` brace, glob) — bash evaluates, the gate sees only literals.
-//   - bare-path `/usr/bin/git` — rejected as not in the safe-list; users with
-//     a non-PATH git must whitelist the full path via config.
-//
-// Visual indicator (so the user can confirm the plugin is loaded):
-//   - console.log on plugin load: "[block-master-push: ACTIVE] vX.Y.Z @ <sha>"
-//   - injected into the system prompt on every LLM call via
-//     `experimental.chat.system.transform`
-//   - self-test: run `block-master-push status` in bash. The plugin throws
-//     a status message that surfaces in the opencode chat as a denied
-//     tool call. Use this to verify the plugin is actually loaded.
-//   - set BLOCK_MASTER_PUSH_DISABLED=1 in the environment to load the
-//     plugin without blocking — useful for cleanup operations.
-//
-// The canonical defence is still server-side branch protection on the remote.
-// ---------------------------------------------------------------------------
-
 const VERSION = "0.2.0"
-const COMMIT = "bc5d48f"  // last commit this plugin was tested with; bump manually when shipping
+const COMMIT = "bc5d48f"
 
 const PROTECTED = new Set(["master", "main"])
 
-/** Outer commands allowed without a git-specific check. Extend via config. */
 const SAFE_OUTER_COMMANDS = new Set([
   "echo",
   "cat",
@@ -95,12 +48,6 @@ const SAFE_OUTER_COMMANDS = new Set([
 
 const CONFIG_ENV_VAR = "BLOCK_MASTER_PUSH_CONFIG"
 
-/**
- * Resolves the default config root each call: ${XDG_CONFIG_HOME}/opencode
- * when XDG_CONFIG_HOME is set and non-empty (Linux users with a non-default
- * XDG config home), otherwise ~/.config/opencode. Computed lazily so a
- * process that sets XDG_CONFIG_HOME after import still picks it up.
- */
 function defaultConfigPath(): string {
   const xdg = process.env.XDG_CONFIG_HOME
   const root = xdg && xdg.length > 0 ? xdg : join(homedir(), ".config")
@@ -111,13 +58,6 @@ type AllowList =
   | { ok: true; extra: Set<string> }
   | { ok: false; reason: string }
 
-/**
- * Reads the user allow-list additions. A missing file, or a file without
- * `additionalAllowedOuterCommands`, keeps the built-in defaults. Anything the
- * gate cannot trust (bad JSON, wrong value type) is a fail-closed signal:
- * `ok: false` makes the caller reject every command rather than silently
- * falling back to a weaker policy.
- */
 function loadUserAllowList(): AllowList {
   const path = process.env[CONFIG_ENV_VAR] || defaultConfigPath()
   if (!existsSync(path)) return { ok: true, extra: new Set() }
@@ -209,8 +149,6 @@ function destinationsOf(args: string[]): string[] {
       const parts = ref.split(":", 2)
       const src = parts[0]
       const dst = parts[1]
-      // Empty destination means a delete of the source-named ref, so the
-      // effective destination is the source side in that case.
       const effective = dst || src
       if (effective) destinations.push(normaliseRef(effective))
     } else {
@@ -230,15 +168,6 @@ export function isProtectedPush(args: string[]): string | null {
   return null
 }
 
-/**
- * Splits on the separator operators that start a new command: `;`, `&&`,
- * `||`, `|`, `&` and newline. Single pass, quote-aware so a separator inside a
- * quoted string stays part of the argument.
- *
- * Grouping operators (`(`, `)`, `{`, `}`) are deliberately NOT split points:
- * leaving them glued to the neighbouring word is what makes `(git push …)` and
- * `{ …; }` fail the allow-list instead of being evaluated.
- */
 function splitSegments(command: string): string[] {
   const segments: string[] = []
   let current = ""
@@ -273,11 +202,6 @@ function splitSegments(command: string): string[] {
 
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
 
-/**
- * Returns the real command word of a segment: the first token that is not a
- * `FOO=bar` environment assignment. An empty result means the segment carried
- * nothing but assignments, so there is no command to classify.
- */
 function stripEnvPrefix(tokens: string[]): string {
   for (const token of tokens) {
     if (!ENV_ASSIGNMENT.test(token)) return token
@@ -289,13 +213,6 @@ function notAllowed(word: string): string {
   return `'${word}' is not in the allow-list of outer commands this gate can verify`
 }
 
-/**
- * Returns a rejection reason, or null when the whole command is acceptable.
- *
- * Fail-closed by construction: a segment passes only if it is `git` (and its
- * push destination is unprotected) or an allow-listed outer command. A command
- * the gate cannot read is never guessed at.
- */
 export function checkPushCommand(command: string): string | null {
   if (command.trim().length === 0) return null
 
@@ -315,7 +232,6 @@ export function checkPushCommand(command: string): string | null {
       if (pushIdx < 0) continue
 
       const pushArgs = args.slice(pushIdx)
-      // A dry run never moves a ref, so no destination is ever reached.
       if (pushArgs.includes("--dry-run") || pushArgs.includes("-n")) continue
 
       const reason = isProtectedPush(pushArgs)
@@ -331,7 +247,7 @@ export function checkPushCommand(command: string): string | null {
   return null
 }
 
-export default (async () => {
+export const BlockMasterPush: Plugin = async ({ client }) => {
   const loadStatus = getPluginStatus()
   console.log(
     `[block-master-push: ${loadStatus.active ? "ACTIVE" : "INACTIVE"}] ` +
@@ -339,6 +255,10 @@ export default (async () => {
       (loadStatus.reason ? ` (${loadStatus.reason})` : "") +
       ` — pushes to master/main are ${loadStatus.active ? "blocked" : "NOT blocked"}`
   )
+
+  void client.tui.showToast({
+    body: { message: "Main branch blocked", variant: "error" },
+  }).catch(() => {})
 
   return {
     "experimental.chat.system.transform": async (_input, output) => {
@@ -358,9 +278,6 @@ export default (async () => {
       const cmd = output.args?.command
       if (typeof cmd !== "string") return
 
-      // Self-test: a single-purpose command that throws a status message.
-      // Surfaces in the opencode chat as a denied tool call with the status
-      // text — the most direct way to verify the plugin is actually loaded.
       const trimmed = cmd.trim()
       if (trimmed === "block-master-push status" || trimmed === "__bmp_status__") {
         const status = getPluginStatus()
@@ -372,11 +289,14 @@ export default (async () => {
         )
       }
 
-      // When disabled, the plugin is loaded but does not block.
       if (process.env.BLOCK_MASTER_PUSH_DISABLED === "1") return
 
       const reason = checkPushCommand(cmd)
       if (reason) {
+        void client.tui.showToast({
+          body: { message: reason, variant: "error" },
+        }).catch(() => {})
+
         throw new Error(
           `Push to master/main blocked by opencode plugin: ${reason}. ` +
             `Use a feature branch and open a PR instead.`
@@ -384,4 +304,6 @@ export default (async () => {
       }
     },
   }
-}) satisfies Plugin
+}
+
+export default BlockMasterPush
