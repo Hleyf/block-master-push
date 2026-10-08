@@ -246,7 +246,9 @@ test("rejects ruby -e with an inline push", () => {
   )
 })
 
-test("rejects node -e with an inline push", () => {
+test("rejects node -e with an inline push", (t) => {
+  const restore = withConfig(null)
+  t.after(restore)
   assert.match(
     checkPushCommand(`node -e 'require("child_process").execSync("git push origin master")'`) ?? "",
     NOT_ALLOWED
