@@ -1,9 +1,10 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin } from "@opencode/plugin/promise/plugin"
+import { Error as ToolError } from "@opencode/plugin/promise/tool"
 import { readFileSync, existsSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 
-const VERSION = "0.2.0"
+const VERSION = "0.3.0"
 const COMMIT = "bc5d48f"
 
 const PROTECTED = new Set(["master", "main"])
@@ -247,63 +248,55 @@ export function checkPushCommand(command: string): string | null {
   return null
 }
 
-export const BlockMasterPush: Plugin = async ({ client }) => {
-  const loadStatus = getPluginStatus()
-  console.log(
-    `[block-master-push: ${loadStatus.active ? "ACTIVE" : "INACTIVE"}] ` +
-      `v${loadStatus.version} @ ${loadStatus.commit}` +
-      (loadStatus.reason ? ` (${loadStatus.reason})` : "") +
-      ` — pushes to master/main are ${loadStatus.active ? "blocked" : "NOT blocked"}`
-  )
+export const BlockMasterPush: Plugin = {
+  id: "block-master-push",
+  setup: async (ctx) => {
+    const loadStatus = getPluginStatus()
+    console.log(
+      `[block-master-push: ${loadStatus.active ? "ACTIVE" : "INACTIVE"}] ` +
+        `v${loadStatus.version} @ ${loadStatus.commit}` +
+        (loadStatus.reason ? ` (${loadStatus.reason})` : "") +
+        ` — pushes to master/main are ${loadStatus.active ? "blocked" : "NOT blocked"}`
+    )
 
-  void client.tui.showToast({
-    body: { message: "Main branch blocked", variant: "error" },
-  }).catch(() => {})
+    const reg = await ctx.tool.hook(
+      "execute.before",
+      async (event) => {
+        if (event.tool !== "bash") return
+        const input = event.input
+        if (typeof input !== "object" || input === null) return
+        const cmd = (input as { command?: unknown }).command
+        if (typeof cmd !== "string") return
 
-  return {
-    "experimental.chat.system.transform": async (_input, output) => {
-      const status = getPluginStatus()
-      if (status.active) {
-        output.system.push(
-          `[block-master-push: ACTIVE v${status.version}] — git push to master/main is blocked by an opencode plugin. Pivot work must go through a feature branch.`
-        )
-      } else {
-        output.system.push(
-          `[block-master-push: INACTIVE v${status.version}] — plugin is loaded but disabled (${status.reason ?? "unknown"}). Pushes to master/main are NOT blocked.`
-        )
+        const trimmed = cmd.trim()
+        if (trimmed === "block-master-push status" || trimmed === "__bmp_status__") {
+          const status = getPluginStatus()
+          throw new ToolError({
+            message:
+              `[block-master-push: ${status.active ? "ACTIVE" : "INACTIVE"}] ` +
+              `v${status.version} @ ${status.commit}` +
+              (status.reason ? ` (${status.reason})` : "") +
+              ` — pushes to master/main are ${status.active ? "blocked" : "NOT blocked"}`,
+          })
+        }
+
+        if (process.env.BLOCK_MASTER_PUSH_DISABLED === "1") return
+
+        const reason = checkPushCommand(cmd)
+        if (reason) {
+          throw new ToolError({
+            message:
+              `Push to master/main blocked: ${reason}. ` +
+              `Use a feature branch and open a PR instead.`,
+          })
+        }
       }
-    },
-    "tool.execute.before": async (input, output) => {
-      if (input.tool !== "bash") return
-      const cmd = output.args?.command
-      if (typeof cmd !== "string") return
+    )
 
-      const trimmed = cmd.trim()
-      if (trimmed === "block-master-push status" || trimmed === "__bmp_status__") {
-        const status = getPluginStatus()
-        throw new Error(
-          `[block-master-push: ${status.active ? "ACTIVE" : "INACTIVE"}] ` +
-            `v${status.version} @ ${status.commit}` +
-            (status.reason ? ` (${status.reason})` : "") +
-            ` — pushes to master/main are ${status.active ? "blocked" : "NOT blocked"}`
-        )
-      }
-
-      if (process.env.BLOCK_MASTER_PUSH_DISABLED === "1") return
-
-      const reason = checkPushCommand(cmd)
-      if (reason) {
-        void client.tui.showToast({
-          body: { message: reason, variant: "error" },
-        }).catch(() => {})
-
-        throw new Error(
-          `Push to master/main blocked by opencode plugin: ${reason}. ` +
-            `Use a feature branch and open a PR instead.`
-        )
-      }
-    },
-  }
+    return async () => {
+      await reg.dispose()
+    }
+  },
 }
 
 export default BlockMasterPush

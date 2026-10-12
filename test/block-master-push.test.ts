@@ -34,6 +34,50 @@ function withConfig(contents: string | null): () => void {
 const NOT_ALLOWED = /not in the allow-list/
 
 // ---------------------------------------------------------------------------
+// v2 plugin harness
+//
+// The default export now follows the OpenCode v2 Promise API:
+// `{ id, setup }`. setup() takes a Context with `ctx.tool.hook(name, cb)`
+// returning `{ dispose }`. The v1 contract (default returning a hooks object;
+// hooks keyed by "tool.execute.before") is dropped.
+
+interface ExecuteBeforeEvent {
+  tool: string
+  sessionID?: unknown
+  callID?: unknown
+  input?: unknown
+}
+
+let capturedBefore:
+  | ((event: ExecuteBeforeEvent) => Promise<void> | void)
+  | undefined
+let disposeCount = 0
+
+async function setupPlugin(): Promise<() => Promise<void>> {
+  capturedBefore = undefined
+  const mockCtx = {
+    tool: {
+      hook: async (
+        _name: "execute.before" | "execute.after",
+        cb: (event: ExecuteBeforeEvent) => Promise<void> | void
+      ) => {
+        capturedBefore = cb
+        return {
+          dispose: async () => {
+            disposeCount++
+          },
+        }
+      },
+    },
+  }
+  const mod = await import("../src/block-master-push.ts")
+  const cleanup = await mod.default.setup(mockCtx as never)
+  return async () => {
+    if (typeof cleanup === "function") await cleanup()
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Unit: argv parsing (unchanged from f19e717)
 // ---------------------------------------------------------------------------
 
@@ -471,17 +515,21 @@ test("config file under XDG_CONFIG_HOME extends the allow-list", (t) => {
 test("malformed config does not break the hook, it blocks it", async (t) => {
   const restore = withConfig("{ broken")
   t.after(restore)
-  const mod = await import("../src/block-master-push.ts")
-  const hooks = await mod.default()
-  const hook = hooks["tool.execute.before"]
-  await assert.rejects(
-    () =>
-      hook(
-        { tool: "bash", sessionID: "s", callID: "c" },
-        { args: { command: "git push origin master" } }
-      ),
-    /malformed/i
-  )
+  const cleanup = await setupPlugin()
+  try {
+    await assert.rejects(
+      async () =>
+        capturedBefore!({
+          tool: "bash",
+          sessionID: "s",
+          callID: "c",
+          input: { command: "git push origin master" },
+        }),
+      /malformed/i
+    )
+  } finally {
+    await cleanup()
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -498,65 +546,124 @@ test("isProtectedPush allows master as the source of a push", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Group 10 — hook integration
+// Group 10 — v2 hook integration
+//
+// The default export is `{ id, setup }`. setup() registers exactly one tool
+// hook (`execute.before`) via ctx.tool.hook(...). All previous Group 10
+// tests get a captured-callback rewrite: we let the default export run
+// setup() against a mock context, capture the callback, then invoke it
+// with synthetic execute.before events.
 // ---------------------------------------------------------------------------
 
-test("default export hook blocks a protected push", async () => {
-  const mod = await import("../src/block-master-push.ts")
-  const hooks = await mod.default()
-  const hook = hooks["tool.execute.before"]
-  await assert.rejects(
-    () =>
-      hook(
-        { tool: "bash", sessionID: "s", callID: "c" },
-        { args: { command: "git push origin master" } }
-      ),
-    /destination ref 'master'/
-  )
+test("default-export setup registers the execute.before tool hook", async () => {
+  disposeCount = 0
+  const cleanup = await setupPlugin()
+  try {
+    assert.ok(
+      typeof capturedBefore === "function",
+      "execute.before callback must be registered"
+    )
+    assert.equal(
+      typeof cleanup,
+      "function",
+      "setup must return a dispose function"
+    )
+  } finally {
+    await cleanup()
+    assert.equal(disposeCount, 1, "cleanup must call dispose on the registration")
+  }
 })
 
-test("default export hook allows a feature push", async () => {
-  const mod = await import("../src/block-master-push.ts")
-  const hooks = await mod.default()
-  const hook = hooks["tool.execute.before"]
-  await hook(
-    { tool: "bash", sessionID: "s", callID: "c" },
-    { args: { command: "git push origin feature" } }
-  )
+test("default-export hook blocks a protected push", async () => {
+  const cleanup = await setupPlugin()
+  try {
+    await assert.rejects(
+      async () =>
+        capturedBefore!({
+          tool: "bash",
+          sessionID: "s",
+          callID: "c",
+          input: { command: "git push origin master" },
+        }),
+      /destination ref 'master'/
+    )
+  } finally {
+    await cleanup()
+  }
 })
 
-test("default export hook ignores non-bash tools", async () => {
-  const mod = await import("../src/block-master-push.ts")
-  const hooks = await mod.default()
-  const hook = hooks["tool.execute.before"]
-  await hook(
-    { tool: "read", sessionID: "s", callID: "c" },
-    { args: { filePath: "/etc/passwd" } }
-  )
+test("default-export hook allows a feature push", async () => {
+  const cleanup = await setupPlugin()
+  try {
+    await capturedBefore!({
+      tool: "bash",
+      sessionID: "s",
+      callID: "c",
+      input: { command: "git push origin feature" },
+    })
+  } finally {
+    await cleanup()
+  }
 })
 
-test("default export hook ignores a non-string command", async () => {
-  const mod = await import("../src/block-master-push.ts")
-  const hooks = await mod.default()
-  const hook = hooks["tool.execute.before"]
-  await hook(
-    { tool: "bash", sessionID: "s", callID: "c" },
-    { args: { command: 42 as unknown as string } }
-  )
+test("default-export hook ignores non-bash tools", async () => {
+  const cleanup = await setupPlugin()
+  try {
+    await capturedBefore!({
+      tool: "read",
+      sessionID: "s",
+      callID: "c",
+      input: { filePath: "/etc/passwd" },
+    })
+  } finally {
+    await cleanup()
+  }
 })
 
-test("default export hook rejects an interpreter bypass", async () => {
-  const mod = await import("../src/block-master-push.ts")
-  const hooks = await mod.default()
-  const hook = hooks["tool.execute.before"]
-  await assert.rejects(
-    () =>
-      hook(
-        { tool: "bash", sessionID: "s", callID: "c" },
-        { args: { command: `bash -c "git push origin master"` } }
-      ),
-    NOT_ALLOWED
-  )
+test("default-export hook ignores a non-string command", async () => {
+  const cleanup = await setupPlugin()
+  try {
+    await capturedBefore!({
+      tool: "bash",
+      sessionID: "s",
+      callID: "c",
+      input: { command: 42 as unknown as string },
+    })
+  } finally {
+    await cleanup()
+  }
+})
+
+test("default-export hook rejects an interpreter bypass", async () => {
+  const cleanup = await setupPlugin()
+  try {
+    await assert.rejects(
+      async () =>
+        capturedBefore!({
+          tool: "bash",
+          sessionID: "s",
+          callID: "c",
+          input: { command: `bash -c "git push origin master"` },
+        }),
+      NOT_ALLOWED
+    )
+  } finally {
+    await cleanup()
+  }
+})
+
+test("default-export hook ignores event.input that is not an object", async () => {
+  const cleanup = await setupPlugin()
+  try {
+    await capturedBefore!({
+      tool: "bash",
+      sessionID: "s",
+      callID: "c",
+      input: "not an object",
+    })
+  } finally {
+    await cleanup()
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -574,6 +681,11 @@ test("command of only separators produces no segments", () => {
 
 // ---------------------------------------------------------------------------
 // Group 12 — visual indicator (so the user can confirm the plugin is loaded)
+//
+// v2 dropped `experimental.chat.system.transform` and `client.tui.showToast`.
+// The visual indicator is now a console.log banner, called from setup(). Tests
+// stub console.log, invoke setup() against the default export, and inspect
+// captured output.
 // ---------------------------------------------------------------------------
 
 test("getPluginStatus returns ACTIVE by default", () => {
@@ -595,82 +707,121 @@ test("getPluginStatus returns INACTIVE when BLOCK_MASTER_PUSH_DISABLED=1", () =>
   }
 })
 
+test("setup emits ACTIVE banner to stdout", async () => {
+  delete process.env.BLOCK_MASTER_PUSH_DISABLED
+  const captured: string[] = []
+  const originalLog = console.log
+  console.log = (...args: unknown[]) => {
+    captured.push(args.map((a) => String(a)).join(" "))
+  }
+  let cleanup: () => Promise<void> | undefined
+  try {
+    cleanup = await setupPlugin()
+  } finally {
+    console.log = originalLog
+  }
+  if (cleanup) await cleanup()
+  assert.ok(
+    captured.some((line) => /\[block-master-push: ACTIVE\]/.test(line)),
+    `expected banner with ACTIVE, got: ${JSON.stringify(captured)}`
+  )
+})
+
+test("setup emits INACTIVE banner when BLOCK_MASTER_PUSH_DISABLED=1", async () => {
+  process.env.BLOCK_MASTER_PUSH_DISABLED = "1"
+  const captured: string[] = []
+  const originalLog = console.log
+  console.log = (...args: unknown[]) => {
+    captured.push(args.map((a) => String(a)).join(" "))
+  }
+  let cleanup: (() => Promise<void>) | undefined
+  try {
+    cleanup = await setupPlugin()
+  } finally {
+    console.log = originalLog
+    delete process.env.BLOCK_MASTER_PUSH_DISABLED
+  }
+  if (cleanup) await cleanup()
+  assert.ok(
+    captured.some((line) => /\[block-master-push: INACTIVE\]/.test(line)),
+    `expected banner with INACTIVE, got: ${JSON.stringify(captured)}`
+  )
+})
+
 test("self-test command 'block-master-push status' throws with ACTIVE status", async () => {
   delete process.env.BLOCK_MASTER_PUSH_DISABLED
-  const mod = await import("../src/block-master-push.ts")
-  const hooks = await mod.default()
-  const hook = hooks["tool.execute.before"]
-  await assert.rejects(
-    () =>
-      hook(
-        { tool: "bash", sessionID: "s", callID: "c" },
-        { args: { command: "block-master-push status" } }
-      ),
-    /\[block-master-push: ACTIVE\]/
-  )
+  const cleanup = await setupPlugin()
+  try {
+    await assert.rejects(
+      async () =>
+        capturedBefore!({
+          tool: "bash",
+          sessionID: "s",
+          callID: "c",
+          input: { command: "block-master-push status" },
+        }),
+      /\[block-master-push: ACTIVE\]/
+    )
+  } finally {
+    await cleanup()
+  }
 })
 
 test("self-test command '__bmp_status__' (alternate form) also throws", async () => {
   delete process.env.BLOCK_MASTER_PUSH_DISABLED
-  const mod = await import("../src/block-master-push.ts")
-  const hooks = await mod.default()
-  const hook = hooks["tool.execute.before"]
-  await assert.rejects(
-    () =>
-      hook(
-        { tool: "bash", sessionID: "s", callID: "c" },
-        { args: { command: "__bmp_status__" } }
-      ),
-    /\[block-master-push: ACTIVE\]/
-  )
+  const cleanup = await setupPlugin()
+  try {
+    await assert.rejects(
+      async () =>
+        capturedBefore!({
+          tool: "bash",
+          sessionID: "s",
+          callID: "c",
+          input: { command: "__bmp_status__" },
+        }),
+      /\[block-master-push: ACTIVE\]/
+    )
+  } finally {
+    await cleanup()
+  }
 })
 
 test("self-test command shows INACTIVE when BLOCK_MASTER_PUSH_DISABLED=1", async () => {
   process.env.BLOCK_MASTER_PUSH_DISABLED = "1"
+  let cleanup: (() => Promise<void>) | undefined
   try {
-    const mod = await import("../src/block-master-push.ts")
-    const hooks = await mod.default()
-    const hook = hooks["tool.execute.before"]
+    cleanup = await setupPlugin()
     await assert.rejects(
-      () =>
-        hook(
-          { tool: "bash", sessionID: "s", callID: "c" },
-          { args: { command: "block-master-push status" } }
-        ),
+      async () =>
+        capturedBefore!({
+          tool: "bash",
+          sessionID: "s",
+          callID: "c",
+          input: { command: "block-master-push status" },
+        }),
       /\[block-master-push: INACTIVE\]/
     )
   } finally {
     delete process.env.BLOCK_MASTER_PUSH_DISABLED
+    if (cleanup) await cleanup()
   }
 })
 
 test("disabled plugin does NOT block a protected push (sanity check)", async () => {
   process.env.BLOCK_MASTER_PUSH_DISABLED = "1"
+  let cleanup: (() => Promise<void>) | undefined
   try {
-    const mod = await import("../src/block-master-push.ts")
-    const hooks = await mod.default()
-    const hook = hooks["tool.execute.before"]
+    cleanup = await setupPlugin()
     // Should NOT throw — plugin is disabled, push goes through (would actually
     // push to master in real life, but here we just verify the hook didn't block)
-    await hook(
-      { tool: "bash", sessionID: "s", callID: "c" },
-      { args: { command: "git push origin master" } }
-    )
+    await capturedBefore!({
+      tool: "bash",
+      sessionID: "s",
+      callID: "c",
+      input: { command: "git push origin master" },
+    })
   } finally {
     delete process.env.BLOCK_MASTER_PUSH_DISABLED
+    if (cleanup) await cleanup()
   }
-})
-
-test("system prompt hook injects ACTIVE status into system array", async () => {
-  delete process.env.BLOCK_MASTER_PUSH_DISABLED
-  const mod = await import("../src/block-master-push.ts")
-  const hooks = await mod.default()
-  const hook = hooks["experimental.chat.system.transform"]
-  assert.ok(hook, "system transform hook not registered")
-  const output = { system: [] as string[] }
-  await hook({ model: {} as any }, output)
-  assert.ok(
-    output.system.some((s: string) => s.includes("[block-master-push: ACTIVE")),
-    `expected system to include [block-master-push: ACTIVE], got: ${JSON.stringify(output.system)}`
-  )
 })
