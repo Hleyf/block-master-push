@@ -9,7 +9,7 @@
     "test": "node --test --experimental-strip-types test/*.test.ts"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.18.16",
+    "@opencode/plugin": "^2.0.27",
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0"
   }
